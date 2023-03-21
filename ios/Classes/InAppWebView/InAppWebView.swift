@@ -522,6 +522,8 @@ public class InAppWebView: WKWebView, UIScrollViewDelegate, WKUIDelegate,
         configuration.userContentController.removeScriptMessageHandler(forName: "onWebMessageListenerPostMessageReceived")
         configuration.userContentController.add(self, name: "onWebMessageListenerPostMessageReceived")
         configuration.userContentController.addUserOnlyScripts(initialUserScripts)
+        configuration.userContentController.removeScriptMessageHandler(forName: "pacific")
+        configuration.userContentController.add(self, name: "pacific")
         configuration.userContentController.sync(scriptMessageHandler: self)
     }
     
@@ -2820,6 +2822,24 @@ if(window.\(JAVASCRIPT_BRIDGE_NAME)[\(_callHandlerID)] != null) {
                     sourceOrigin = URL(string: "\(scheme)://\(host)\(port != nil && port != 0 ? ":" + String(port!) : "")")
                 }
                 webMessageListener.channelDelegate?.onPostMessage(message: messageData, sourceOrigin: sourceOrigin, isMainFrame: isMainFrame)
+            } else if message.name == "pacific" {
+                let callback = WebViewChannelDelegate.CallJsHandlerCallback()
+                let body = message.body as! [String: Any?]
+                if let dict = body as? Dictionary<String, AnyObject> {
+                    if let test = dict["parameters"] as? Dictionary<String, AnyObject>{
+                        var list : [Dictionary<String, AnyObject>] = []
+                        list.append(test)
+                        let jsonObject = try? JSONSerialization.data(withJSONObject: list, options: [])
+                        if let jsonString = String(data: jsonObject!, encoding: .utf8) {
+                            var webView = self
+                            if let channelDelegate = webView.channelDelegate {
+                                channelDelegate.onCallJsHandler(handlerName: "pacific", args: jsonString, callback: callback)
+                            }
+                        } else {
+                            print("--- could not convert ---")
+                        }
+                    }
+                }
             }
         }
     }
