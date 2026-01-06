@@ -1,0 +1,275 @@
+name: NPM Audit Auto-Fix
+
+on:
+  workflow_dispatch: # Manual trigger only
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  npm-audit-fix:
+    runs-on: ubuntu-latest
+    env:
+      WORKING_DIRECTORY: test_node_server
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Node version
+        id: node_version
+        shell: bash
+        run: |
+          # Check for .nvmrc first
+          if [ -f .nvmrc ]; then
+            VERSION=$(cat .nvmrc | tr -d 'v' | tr -d '[:space:]')
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "source=.nvmrc" >> "$GITHUB_OUTPUT"
+          # Check package.json engines.node
+          elif [ -f package.json ] && command -v node &> /dev/null; then
+            VERSION=$(node -p "require('./package.json').engines?.node || ''" 2>/dev/null | sed 's/[^0-9.]//g' | head -1)
+            if [ -n "$VERSION" ]; then
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "source=package.json" >> "$GITHUB_OUTPUT"
+            else
+              echo "version=20" >> "$GITHUB_OUTPUT"
+              echo "source=default" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "version=20" >> "$GITHUB_OUTPUT"
+            echo "source=default" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node_version.outputs.version }}
+          cache: 'npm'
+
+      - name: Detect package manager and versions
+        id: detect_versions
+        run: |
+          # Detect Node version
+          NODE_VERSION=$(node --version)
+          echo "node_version=$NODE_VERSION" >> $GITHUB_OUTPUT
+          
+          # Detect NPM version
+          NPM_VERSION=$(npm --version)
+          echo "npm_version=$NPM_VERSION" >> $GITHUB_OUTPUT
+          
+          # Detect if using Yarn
+          if [ -f "yarn.lock" ]; then
+            echo "package_manager=yarn" >> $GITHUB_OUTPUT
+            if command -v yarn &> /dev/null; then
+              YARN_VERSION=$(yarn --version 2>/dev/null || echo "not installed")
+              echo "yarn_version=$YARN_VERSION" >> $GITHUB_OUTPUT
+            fi
+          # Detect if using pnpm
+          elif [ -f "pnpm-lock.yaml" ]; then
+            echo "package_manager=pnpm" >> $GITHUB_OUTPUT
+            if command -v pnpm &> /dev/null; then
+              PNPM_VERSION=$(pnpm --version 2>/dev/null || echo "not installed")
+              echo "pnpm_version=$PNPM_VERSION" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "package_manager=npm" >> $GITHUB_OUTPUT
+          fi
+          
+          # Detect engines from package.json
+          if [ -f "package.json" ]; then
+            echo "has_package_json=true" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Environment detected successfully"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run NPM Audit (JSON)
+        id: audit
+        run: |
+          # Run audit and save to file, ignore exit code
+          npm audit --json > audit-report.json || true
+          
+          # Check if vulnerabilities exist
+          if [ -s audit-report.json ]; then
+            echo "has_vulnerabilities=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_vulnerabilities=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run NPM Audit Fix
+        id: audit_fix
+        run: |
+          # Run audit fix and capture output
+          npm audit fix > audit-fix.log 2>&1 || true
+          
+          # Save log content as output (escape for multiline)
+          {
+            echo 'fix_log<<EOF'
+            cat audit-fix.log
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Run NPM CI after fix
+        id: npm_ci
+        continue-on-error: true
+        run: |
+          set +e  # Disable exit on error for this step
+          npm ci > npm-ci.log 2>&1
+          CI_EXIT_CODE=$?
+          
+          if [ $CI_EXIT_CODE -eq 0 ]; then
+            echo "ci_status=✅ Success" >> $GITHUB_OUTPUT
+            echo "ci_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "ci_status=❌ Failed" >> $GITHUB_OUTPUT
+            echo "ci_success=false" >> $GITHUB_OUTPUT
+            echo "CI failed with exit code $CI_EXIT_CODE"
+            cat npm-ci.log
+          fi
+          
+          exit 0  # Always exit successfully so workflow continues
+
+      - name: Parse audit results and create PR body
+        id: create_pr_body
+        run: |
+          cat > parse_audit.js << 'SCRIPT'
+          const fs = require('fs');
+          
+          try {
+            const auditData = JSON.parse(fs.readFileSync('audit-report.json', 'utf8'));
+            const fixLog = fs.readFileSync('audit-fix.log', 'utf8');
+          
+            let prBody = '';
+          
+            prBody += '## 🔒 NPM Security Audit\n\n';
+          
+            // Add build status alert at the top
+            if (process.env.CI_SUCCESS === 'false') {
+              prBody += '> [!CAUTION]\n';
+              prBody += '> Build Check Failed. Please resolve build issues before merging this security fix PR\n\n';
+            } else {
+              prBody += '> [!NOTE]\n';
+              prBody += '> Build Check Successful.\n\n';
+            }
+          
+            // Summary
+            const metadata = auditData.metadata || {};
+            const vulns = metadata.vulnerabilities || {};
+            const total = vulns.total || 0;
+          
+            if (total === 0) {
+              prBody += '✅ No vulnerabilities found.\n\n';
+            } else {
+              prBody += `Found **${total} vulnerabilities**: `;
+              prBody += `${vulns.critical || 0} critical, ${vulns.high || 0} high, ${vulns.moderate || 0} moderate, ${vulns.low || 0} low\n\n`;
+          
+              // Vulnerabilities table
+              if (auditData.vulnerabilities && Object.keys(auditData.vulnerabilities).length > 0) {
+                prBody += '### Vulnerabilities\n\n';
+                prBody += '| Package | Severity | Range | Fix Available |\n';
+                prBody += '|---------|----------|-------|---------------|\n';
+          
+                for (const [pkg, details] of Object.entries(auditData.vulnerabilities)) {
+                  const severity = details.severity || 'unknown';
+                  const range = details.range || 'N/A';
+                  const fixAvailable = details.fixAvailable;
+                  const fixVersion = fixAvailable && typeof fixAvailable === 'object' 
+                    ? fixAvailable.version 
+                    : (fixAvailable ? '✓' : '✗');
+          
+                  const severityEmoji = {
+                    critical: '🔴',
+                    high: '🟠',
+                    moderate: '🟡',
+                    low: '🟢'
+                  }[severity] || '⚪';
+          
+                  prBody += `| ${pkg} | ${severityEmoji} ${severity} | ${range} | ${fixVersion} |\n`;
+                }
+                prBody += '\n';
+              }
+            }
+          
+            // Details in dropdown
+            prBody += '<details>\n<summary>Audit Fix Log</summary>\n\n';
+            prBody += '```\n' + fixLog + '\n```\n';
+            prBody += '</details>\n\n';
+          
+            prBody += '<details>\n<summary>Environment</summary>\n\n';
+            prBody += `- Node.js: ${process.env.NODE_VERSION}\n`;
+            prBody += `- NPM: ${process.env.NPM_VERSION}\n`;
+            prBody += `- Package Manager: ${process.env.PKG_MANAGER}\n`;
+            prBody += '</details>\n';
+          
+            // Write to file for GitHub Actions
+            fs.writeFileSync('pr-body.txt', prBody);
+          
+            console.log('PR body created successfully');
+          } catch (error) {
+            console.error('Error parsing audit data:', error);
+            const fallbackBody = '## NPM Security Audit\n\nFailed to parse audit results. Please check the workflow logs.';
+            fs.writeFileSync('pr-body.txt', fallbackBody);
+          }
+          SCRIPT
+          
+          NODE_VERSION="${{ steps.detect_versions.outputs.node_version }}" \
+          NPM_VERSION="${{ steps.detect_versions.outputs.npm_version }}" \
+          PKG_MANAGER="${{ steps.detect_versions.outputs.package_manager }}" \
+          CI_STATUS="${{ steps.npm_ci.outputs.ci_status }}" \
+          CI_SUCCESS="${{ steps.npm_ci.outputs.ci_success }}" \
+          node parse_audit.js
+
+      - name: Check for changes
+        id: git_status
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add only package files and node_modules
+          git add package-lock.json package.json node_modules/ 2>/dev/null || true
+          
+          if git diff --cached --exit-code; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.audit.outputs.has_vulnerabilities == 'true' && steps.git_status.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: fix npm security vulnerabilities'
+          branch: npm-audit-fix-${{ github.run_number }}
+          delete-branch: true
+          title: 'NPM Security Audit - Automated Fixes'
+          body-path: ${{ env.WORKING_DIRECTORY }}/pr-body.txt
+          labels: |
+            security
+            dependencies
+            fix
+          assignees: ${{ github.actor }}
+          base: master
+          add-paths: |
+            ${{ env.WORKING_DIRECTORY }}/package-lock.json
+            ${{ env.WORKING_DIRECTORY }}/package.json
+            ${{ env.WORKING_DIRECTORY }}/node_modules/
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-results
+          path: |
+            ${{ env.WORKING_DIRECTORY }}/audit-report.json
+            ${{ env.WORKING_DIRECTORY }}/audit-fix.log
+            ${{ env.WORKING_DIRECTORY }}/npm-ci.log
+          retention-days: 30
